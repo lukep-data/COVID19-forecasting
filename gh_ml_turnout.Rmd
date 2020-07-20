@@ -1,0 +1,269 @@
+---
+title: "Predicting Turnout in U.S. Presidential Elections"
+author: "Rebeca J. Agosto Rosa (rja2), Alice Iannantuoni (iannntn2), Luke Plutowski (plutows2)"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  pdf_document: default
+  html_document: 
+    theme: cosmo
+    toc: yes
+urlcolor: blue
+---
+
+```{r, setup, include = FALSE, echo = FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.align = "center", 
+                      cache = TRUE, autodep = TRUE)
+```
+
+```{r, loadpackages, message=FALSE, warning=FALSE}
+library(readr)
+library(tidyverse)
+library(reshape)
+library(dplyr)
+library(stringr)
+library(caret)
+library(randomForest)
+library(gbm)
+library(kableExtra)
+library(ggplot2)
+```
+
+***
+
+# Abstract
+
+> Statistical learning methods were applied to county-level U.S. federal election data in order to build a predictive model of electoral turnout. Data from the 2012 election was used to train models using a number of approaches, and the best-performing one was tested on data from the 2016 election. While random forest and gradient boosting methods performed well, the simpler linear regression model was ultimately preferred because it performed similarly as well. K-nearest neighbors and tree models were also evaluated, but did not perform comparably well.
+
+***
+
+# Introduction
+
+Who turns out to vote in presidential elections? Predicting electoral turnout is important to understand and operate in a political system on many levels. Political candidates and their advisers care to predict the likelihood that voters will turn out at the local level, so to be able to target campaign activities and invest their resources to mobilize voters in the areas that would benefit them. Journalists also need to understand the predictors of election turnout in order to assess and report on the political climate, with nuance to geographic differences. A reliable model of turnout is essential to pollsters, who necessitate that information in order to design good sampling procedures for their polls---such that they would capture a representative sample of likely voters. Social scientists care to understand what motivates the decision to vote, thus---while a predictive model does not necessarily establish causal relationships between the response variable and its predictors---this exercise can help illuminate some previously underappreciated correlates of voting behavior. Lastly, because these elections happen in the context of a democratic country where most citizens[^1] are invited to participate in choosing their political representatives, a predictive model of electoral turnout can be useful for the general public as well, as with better information about how political processes work comes a greater ability to affect them.  
+
+With data from the MIT Election Data and Science Lab 2018 Election Analysis Dataset, we leverage county-level demographic and past election information to predict county-level turnout and results of the 2016 U.S. presidential elections in 49 states.[^2]
+
+# Methods
+
+## Data
+
+The data at hand are made available by the MIT Election Data and Science Lab, and contain electoral and demographic information at the county level for 2012 and 2016 U.S. presidential elections. Additional county-level demographic statistics, drawn from the US Census Bureau's American Community Survey, are included as features. For estimation purposes, the data are split by year (2012 and 2016) to serve as training and test sets.
+
+Demographic characteristics are reported as five-year estimates, leading up to the 2012 and 2016 elections (i.e. 2008--2012, and 2012--2016), and include the following: 
+* The total population size, and the voting-age population
+* Ethnic, racial, and foreign-born composition of the population
+* Gender and age composition of the population, specifically for population 29 years of age or under, and 65 years of age and older
+* Socioeconomic information, including median household income, unemployment, and education levels (both for entire population and for white population)
+* Information on the rural-urban breakdown in the county
+
+The outcome variable is a county-level measure of voter turnout in 2012 and 2016. Turnout is calculated by dividing the total presidential votes in an election by the voting age population, which is an estimate. Turnout is reported as the percentage of elegible voters who vote.
+
+```{r, loaddata, message=FALSE, warning=FALSE}
+elec = read_csv("elec_analysis.csv")
+
+# split data for analysis
+elec_16 = elec %>%
+  select(state:rural_pct, turnout16, pvrty_prct) # excluding: bldg_permits and ruralurban_cc
+elec_12 = elec %>%
+  select(state, county, turnout12, female_pct_12:lesscollege_whites_pct_12, rural_pct)
+
+# turn 2012 proportions into percentages to match 2016 data
+elec_12[, 4:8] = elec_12[, 4:8] * 100
+elec_12[, 10:17] = elec_12[, 10:17] * 100
+
+# rename variables to match names across election years
+elec_12 = rename(elec_12, c("female_pct_12" = "female_pct", "black_pct_12" = "black_pct", "lesscollege_pct_12" = "lesscollege_pct", "age29andunder_pct_12" = "age29andunder_pct", "lesshs_whites_pct_12" = "lesshs_whites_pct", "hispanic_pct_12" = "hispanic_pct", "clf_unemploy_pct_12" = "clf_unemploy_pct", "lesshs_pct_12" = "lesshs_pct", "age65andolder_pct_12" = "age65andolder_pct", "lesscollege_whites_pct_12" = "lesscollege_whites_pct", "white_pct_12" = "white_pct", "median_hh_inc_12" = "median_hh_inc", "pvrty_pct_12" = "pvrty_pct", "foreignborn_pct_12" = "foreignborn_pct", "turnout12" = "turnout"))
+elec_16 = rename(elec_16, c("pvrty_prct" = "pvrty_pct", "turnout16" = "turnout"))
+```
+
+## Descriptive Analysis
+
+The average county-level turnout in 2012 was `r round(mean(elec_12$turnout), digits = 2)`% (median = `r round(median(elec_12$turnout), digits = 2)`%), with turnout ranging from `r round(min(elec_12$turnout), digits = 2)`% to `r round(max(elec_12$turnout), digits = 2)`% across all counties. Five counties registered over 100% turnout. This could be due to measurement error or the fact that we use an estimate of voting age population (rather than actual voting age population) to calculate turnout. The actual voting age population is unknown.
+
+```{r, summary stats}
+turn_12_summary = summary(elec_12$turnout)
+counties_over_100 = elec_12[elec_12$turnout > 100, ]
+```
+
+```{r, hist, message=FALSE, warning=FALSE}
+p = ggplot(data = elec_12, aes(turnout))
+p + geom_histogram(color = "lightblue", fill = "gray") +
+  labs(y = "Frequency", x = "Turnout (2012)", title = "Histogram of 2012 County-level Turnout") +
+  theme_bw()
+
+most_counties_pct = (table(elec_12$turnout > 50 & elec_12$turnout < 70) / nrow(elec_12)) * 100
+```
+
+A histogram of 2012 county-level turnout shows that there is variation in turnout across counties, but most counties (`r round(most_counties_pct[2], digits = 2)`%) are estimated to achieve around 50-70% turnout.
+
+## Modeling and Estimation
+
+In the modeling stage, we predict percentage of voter turnout in each county in 2012 using the demographic features. We train each model using 10-fold cross-validation (CV) repeated 5 times or out-of-bag (OOB) error. To judge model fit, we use the cross-validated root mean squared error (RMSE).
+
+We estimate six models: a linear model, two random forest models (CV and OOB), a gradient boosting machine model (BGM), a k-nearest neighbors model (KNN), and a tree model.
+
+```{r, lm-mod, message=FALSE, warning=FALSE}
+set.seed(705)
+lm_mod = caret::train(
+  form = turnout ~ . -county,
+  data = elec_12,
+  method = "lm",
+  trControl = trainControl(method = "repeatedcv",
+                           number = 10,
+                           repeats = 5))
+```
+
+```{r, rf-cv, message=FALSE, warning=FALSE}
+set.seed(705)
+rf_mod_cv = caret::train(
+  form = turnout ~ . -county,
+  data = elec_12,
+  method = "rf",
+  trControl = trainControl(method = "repeatedcv",
+                           number = 10,
+                           repeats = 5))
+```
+
+```{r, rf-oob, message=FALSE, warning=FALSE}
+set.seed(705)
+rf_mod_oob = caret::train(
+  form = turnout ~ . -county,
+  data = elec_12,
+  method = "rf",
+  trControl = trainControl(method = "oob"))
+```
+
+```{r, gbm, message=FALSE, warning=FALSE}
+set.seed(705)
+gbm_mod = caret::train(
+  form = turnout ~ . -county,
+  data = elec_12,
+  method = "gbm",
+  verbose = FALSE,
+  trControl = trainControl(method = "repeatedcv",
+                           number = 10,
+                           repeats = 5))
+```
+
+```{r, knn, message=FALSE, warning=FALSE}
+set.seed(705)
+knn_mod = caret::train(
+  form = turnout ~ . -county,
+  data = elec_12,
+  method = "knn",
+  trControl = trainControl(method = "repeatedcv",
+                           number = 10,
+                           repeats = 5))
+```
+
+```{r, tree, message=FALSE, warning=FALSE}
+set.seed(705)
+tree_mod = caret::train(
+  form = turnout ~ . -county,
+  data = elec_12,
+  method = "rpart",
+  trControl = trainControl(method = "repeatedcv",
+                           number = 10,
+                           repeats = 5))
+```
+
+# Results
+
+Results are shown in the table below. Each row represents one model. We list the specifications of the best model according to cross-validated RMSE. The random forest with 5 times repeated 10-fold cross-validation achieves the lowest cross-validated RMSE. The KNN model performs much worse than the other models.
+
+```{r, the_results}
+tibble("Model" = c("Linear", "Random Forest", "Random Forest", "GBM", "KNN", "Tree"), "Validation" = c("5x 10-fold CV", "5x 10-fold CV", "OOB", "5x 10-fold CV", "5x 10-fold CV", "5x 10-fold CV"), "Best Model" = c("---", "mtry = 64, splitrule = extratrees", "mtry = 64", "trees = 150, Int. Depth = 3", "k = 9", "cp = 0.0298"), "RMSE" = c(lm_mod$results$RMSE, 5.047311, min(rf_mod_oob$results$RMSE), min(gbm_mod$results$RMSE), min(knn_mod$results$RMSE), min(tree_mod$results$RMSE))
+       ) %>%
+  kable(digits = 3) %>%
+  kable_styling("striped", full_width = FALSE)
+```
+
+# Discussion
+
+```{r, model-selection, eval = FALSE}
+std_dev = sd(rf_mod_cv$resample$RMSE)
+rf_rmse = min(rf_mod_cv$results$RMSE)
+one_sd = rf_rmse + std_dev
+```
+
+```{r, best-model}
+lm_predict = predict(lm_mod, elec_16)
+test_rmse = sqrt(mean((elec_16$turnout - lm_predict) ^ 2))
+```
+
+While the random forest with 5-time repeated 10-fold cross-validation achieves the lowest cross-validated RMSE, the GBM, linear, and OOB random forest models closely follow it, with all models achieving RMSEs that are within one standard deviation (sd = `r round(std_dev, digits = 3)`) of the model with the lowest RMSE. Since the linear model is a simpler model, yet performs similarly well to the random forest and GBM models in the training data, the linear model is considered the best model to predict election turnout.
+
+When making predictions on the test data (2016 election), the linear model achieves a test RMSE of `r round(test_rmse, digits = 3)`, which is close to the training RMSE (2012 data) of the linear model, as well as that of some other models. This suggests that a model using demographic county-level features performs similarly across the two elections. However, as the actual versus predicted plots show, the linear model with demographic predictors does not account for all of the variation in county-level turnout.
+
+```{r, figures}
+results_trn = tibble(actual = elec_12$turnout, predicted = predict(lm_mod, elec_12))
+
+p1 = ggplot(data = results_trn, aes(x = actual, y = predicted)) +
+  geom_abline(colour = "gray") +
+  geom_point(alpha = 0.5, size = 1) +
+  theme_bw() + 
+  geom_blank() +
+  labs(x = "Actual Turnout", 
+       y = "Predicted Turnout",
+       title = "Linear Model Predictions",
+       subtitle = "Actual vs. Predicted: Traning Data (2012)") +
+  xlim(0, 130) +
+  ylim(0, 130)
+
+results_tst = tibble(actual = elec_16$turnout, predicted = predict(lm_mod, elec_16))
+
+p2 = ggplot(data = results_tst, aes(x = actual, y = predicted)) +
+  geom_abline(colour = "gray") +
+  geom_point(alpha = 0.5, size = 1) +
+  theme_bw() + 
+  geom_blank() +
+  labs(x = "Actual Turnout", 
+       y = "Predicted Turnout",
+       title = "",
+       subtitle = "Actual vs. Predicted: Test Data (2016)") +
+  xlim(0, 130) +
+  ylim(0, 130)
+
+gridExtra::grid.arrange(p1, p2, ncol=2)
+```
+
+We propose three potential explanations (and opportunities for future analyses) to explain the lack of a better fit.
+
+First, we attempted to predict turnout at the county-level in large part because it was the smallest unit of analysis at which the data was available at the national level. However, this may not be the most relevant unit of analysis. Since turnout can be influenced by individual and environmental-level factors, the relevant unit of analysis could be individual voters or a smaller (or larger) spatial unit. At the individual level, some relevant factors would include voters' political interest, knowledge and efficacy, socioeconomic status, education, social network, among others. With the appropriate data, turnout could be modeled at the individual level while also accounting for spatial correlations.
+
+Second, we predicted turnout as a function of county-level demographic variables, but other known relevant factors in motivating turnout, like the competitiveness of the election, the issues at stake, the media coverage, local electoral rules (e.g., ease of voter registration) and the candidates, are not included in the model. This information is not easily available (e.g., competitiveness, rules) or measured at the necessary level (e.g., local/national media consumption at the county level).
+
+Third, due to data limitations, our analysis only considered two election years, 2012 and 2016, which differ in ways not captured by our model. For example, in these elections, the candidates (Obama vs. Romney; Clinton vs. Trump), increased polarization, changes to the economy, among others, helped mobilize different electoral subgroups which are distributed differently across counties.
+
+One final consideration is that the outcome variable --turnout-- is an estimate. As mentioned in the descriptive analysis, there is no precise measure of the voting age population in a county in a given year. Five-year estimates are used to calculate the percentage of the voting age population who votes. This leads to a few odd cases where counties register more than a 100% turnout, which does not occur in reality. This could add some noise to the analysis.
+
+In sum, future work on predicting turnout should collect data for a larger number of election years and at the appropriate levels in order to account for the influence of the specific election/campaign, and individual and community-level characteristics on turnout.
+
+# Appendix
+
+## Data Dictionary
+
+1. State: state name
+2. County: county name
+3. Turnout: the percentage of the voting age population who votes
+4. female_pct: females as a percentage of total population
+5. hispanic_pct: Hispanics or Latinos as a percentage of total population
+6. white_pct: non-Hispanic whites as a percentage of total population
+7. black_pct: non-Hispanic blacks as a percentage of total population
+8. clf_unemploy_pct: unemployed population in labor force as a percentage of total population in civilian labor force
+9. median_hh_inc: median household income in the past 12 months (in 2016 inflation-adjusted dollars)
+10. lesscollege_pct: population with an education of less than a bachelor's degree as a percentage of total population
+11. lesshs_pct: population with an education of less than a regular high school diploma as a percentage of total population
+12. pvrty_pct: percent of persons below poverty level
+13. age29andunder_pct: population 29 years or under as a percentage of total population
+14. age65andolder_pct: population 65 years or older as a percentage of total population
+15. foreignborn_pct: foreign-born population as a percentage of total population
+16. lesshs_whites_pct: white population with an education of less than a regular high school diploma as a percentage of total population
+17. lesscollege_whites_pct: white population with an education of less than a bachelor's degree as a percentage of total population
+18. rural_pct: rural population as a percentage of total population
+
+# References
+
+MIT Election Data and Science Lab, 2018, "County Presidential Election Returns 2000-2016", https://doi.org/10.7910/DVN/VOQCHQ, Harvard Dataverse, V5, UNF:6:cp3645QomksTRA+qYovIDQ== [fileUNF]
+
+[^1]: With some notable exclusions, e.g. citizens under 18 years of age, certain felons in certain states, etc.
+[^2]: Data for Alaska is not available.
